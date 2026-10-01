@@ -1,0 +1,30 @@
+name: Job Page Auto Publisher
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_url:
+        description: "Source Job/Result/Admit-Card Notification URL"
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python deps install
+        run: pip install -r requirements.txt
+
+      - name: Job page banao aur site repo me publish karo
+        env:
+          JOB_URL: ${{ inputs.job_url }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: "bgsarkariresult/bgsarkariresult"
+          SITE_BASE_URL: "https://bgsarkariresult.github.io/bgsarkariresult"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python full_automation_bot.py
