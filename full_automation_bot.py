@@ -77,17 +77,43 @@ def _normalize_url(base_url, href):
     return urljoin(base_url, href.strip()) if href else ""
 
 
-def _classify_link(label, href):
+def _is_source_article_url(href, source_url):
+    if not href:
+        return True
+    from urllib.parse import urlparse
+    try:
+        h = urlparse(href)
+        s = urlparse(source_url)
+        return h.netloc.lower().replace("www.", "") == s.netloc.lower().replace("www.", "")
+    except Exception:
+        return False
+
+
+def _is_likely_official_url(href):
+    if not href or not re.match(r"^https?://", href, re.IGNORECASE):
+        return False
+    host = href.lower()
+    blocked = ["freejobalert.com", "sarkariresult.com", "indiafreejobalert.com"]
+    return not any(domain in host for domain in blocked)
+
+
+def _classify_link(label, href, source_url=""):
     if not re.match(r"^https?://", href or "", re.IGNORECASE):
+        return ""
+    if _is_source_article_url(href, source_url):
         return ""
     text = f"{label} {href}".lower()
     if any(x in text for x in ["notification", "advertisement", "notice pdf", "official notification", "download notification", ".pdf"]):
         return "notification"
-    if any(x in text for x in ["apply online", "online application", "registration", "apply now", "application form"]):
+    if any(x in text for x in ["apply online", "online application", "registration", "apply now", "application form", "authentication.aspx"]):
         return "apply"
-    if any(x in text for x in ["official website", "official site", "official portal", "website"]):
+    if any(x in text for x in ["official website", "official site", "official portal", "website"]) or _is_likely_official_url(href):
         return "website"
     return ""
+
+
+def _extract_explicit_urls(text):
+    return re.findall(r'https?://[^\s<>"\']+', text or "", flags=re.IGNORECASE)
 
 
 def _extract_structured_fields(soup, text):
@@ -176,7 +202,7 @@ def scrape_job_details(url):
 
         for a in soup.find_all("a", href=True):
             href = _normalize_url(res.url, a.get("href"))
-            kind = _classify_link(a.get_text(" ", strip=True), href)
+            kind = _classify_link(a.get_text(" ", strip=True), href, url)
             if kind == "notification" and not data["pdf_url"]:
                 data["pdf_url"] = href
             elif kind == "apply" and not data["apply_url"]:
@@ -186,8 +212,35 @@ def scrape_job_details(url):
 
         for a in soup.find_all("a", href=True):
             href = _normalize_url(res.url, a.get("href"))
-            if href.lower().split("?")[0].endswith(".pdf") and not data["pdf_url"]:
+            if href.lower().split("?")[0].endswith(".pdf") and not _is_source_article_url(href, url) and not data["pdf_url"]:
                 data["pdf_url"] = href
+
+        # Some FreeJobAlert pages expose the real official links only as plain text.
+        # Parse those URLs too, but NEVER use the FreeJobAlert/source article itself.
+        explicit_urls = _extract_explicit_urls(data["raw_text"])
+        for href in explicit_urls:
+            href = href.rstrip(").,;")
+            if _is_source_article_url(href, url):
+                continue
+            low = href.lower()
+            if (".pdf" in low or "notificationpdf" in low or "notification/" in low) and not data["pdf_url"]:
+                data["pdf_url"] = href
+            elif ("authentication.aspx" in low or "apply" in low or "registration" in low) and not data["apply_url"]:
+                data["apply_url"] = href
+            elif _is_likely_official_url(href) and not data["official_site"]:
+                data["official_site"] = href
+
+        # If the article explicitly names the official portal but omits a clickable href,
+        # use the named official domain as the website/apply destination.
+        if not data["official_site"]:
+            if "joinindianarmy.nic.in" in data["raw_text"].lower():
+                data["official_site"] = "https://joinindianarmy.nic.in/"
+        if not data["apply_url"] and "joinindianarmy.nic.in" in data["raw_text"].lower():
+            data["apply_url"] = "https://joinindianarmy.nic.in/Authentication.aspx"
+        if not data["pdf_url"] and "joinindianarmy.nic.in" in data["raw_text"].lower():
+            m = re.search(r'https?://[^\s<>"\']*(?:\.pdf|notificationpdf)[^\s<>"\']*', data["raw_text"], re.IGNORECASE)
+            if m:
+                data["pdf_url"] = m.group(0).rstrip(").,;")
 
         title_lower = data["title"].lower()
         if any(k in title_lower for k in ["admit card", "hall ticket", "call letter", "city intimation"]):
@@ -641,7 +694,15 @@ Total Vacancies: {job['total_vacancies']}
 Last Date / Available from: {job['last_date']}
 Qualification: {job['qualification']}
 Age Limit: {job['age_limit']}
-Source Raw Text: {job['raw_text'][:2500]}
+Source Raw Text: {job['raw_text'][:12000]}
+Extracted Salary: {job['salary']}
+Extracted Fee: {job['fee']}
+Extracted Selection Process: {job['selection_process']}
+Extracted Department: {job['department']}
+Extracted Post Name: {job['post_name']}
+Extracted Official Website: {job['official_site']}
+Extracted Notification URL: {job['pdf_url']}
+Extracted Apply URL: {job['apply_url']}
 
 STRICT RULES (MUST FOLLOW):
 1. Return ONLY raw HTML. No markdown, no ```html, no code fences.
