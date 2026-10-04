@@ -53,68 +53,193 @@ def slugify(text):
     return re.sub(r'[\s_-]+', '-', text).strip('-')
 
 
+def _clean_value(value):
+    if value is None:
+        return ""
+    value = re.sub(r"\s+", " ", str(value)).strip(" :|-")
+    if not value or value.lower() in {"n/a", "na", "not available", "not mentioned", "various", "various posts"}:
+        return ""
+    return value
+
+
+def _first_match(text, patterns):
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            value = _clean_value(match.group(1))
+            if value:
+                return value
+    return ""
+
+
+def _normalize_url(base_url, href):
+    from urllib.parse import urljoin
+    return urljoin(base_url, href.strip()) if href else ""
+
+
+def _classify_link(label, href):
+    if not re.match(r"^https?://", href or "", re.IGNORECASE):
+        return ""
+    text = f"{label} {href}".lower()
+    if any(x in text for x in ["notification", "advertisement", "notice pdf", "official notification", "download notification", ".pdf"]):
+        return "notification"
+    if any(x in text for x in ["apply online", "online application", "registration", "apply now", "application form"]):
+        return "apply"
+    if any(x in text for x in ["official website", "official site", "official portal", "website"]):
+        return "website"
+    return ""
+
+
+def _extract_structured_fields(soup, text):
+    fields = {
+        "total_vacancies": "", "qualification": "", "age_limit": "", "last_date": "",
+        "start_date": "", "salary": "", "fee": "", "selection_process": "",
+        "department": "", "post_name": ""
+    }
+
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr"):
+            cells = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
+            if len(cells) < 2:
+                continue
+            key = cells[0].lower()
+            value = _clean_value(" ".join(cells[1:]))
+            if not value:
+                continue
+            if any(x in key for x in ["total vacancy", "total post", "no. of vacancy", "number of vacancy", "vacancies"]):
+                fields["total_vacancies"] = fields["total_vacancies"] or value
+            elif any(x in key for x in ["qualification", "educational qualification", "education"]):
+                fields["qualification"] = fields["qualification"] or value
+            elif "age" in key and "limit" in key:
+                fields["age_limit"] = fields["age_limit"] or value
+            elif any(x in key for x in ["last date", "closing date", "end date", "application last date"]):
+                fields["last_date"] = fields["last_date"] or value
+            elif any(x in key for x in ["start date", "starting date", "application start"]):
+                fields["start_date"] = fields["start_date"] or value
+            elif any(x in key for x in ["salary", "pay scale", "pay level"]):
+                fields["salary"] = fields["salary"] or value
+            elif any(x in key for x in ["application fee", "exam fee", "fee"]):
+                fields["fee"] = fields["fee"] or value
+            elif any(x in key for x in ["selection process", "selection procedure"]):
+                fields["selection_process"] = fields["selection_process"] or value
+            elif any(x in key for x in ["department", "organization", "recruiting body"]):
+                fields["department"] = fields["department"] or value
+            elif any(x in key for x in ["post name", "name of post", "posts"]):
+                fields["post_name"] = fields["post_name"] or value
+
+    fields["total_vacancies"] = fields["total_vacancies"] or _first_match(text, [
+        r"(?:total\s+(?:number\s+of\s+)?vacanc(?:y|ies)|total\s+posts?|no\.\s*of\s*posts?)\s*[:\-]\s*([0-9][0-9,]*)",
+        r"([0-9][0-9,]*)\s+(?:posts?|vacancies?)\b"
+    ])
+    fields["qualification"] = fields["qualification"] or _first_match(text, [r"(?:educational\s+)?qualification\s*[:\-]\s*([^\n]+)"])
+    fields["age_limit"] = fields["age_limit"] or _first_match(text, [r"age\s+limit\s*[:\-]\s*([^\n]+)"])
+    fields["last_date"] = fields["last_date"] or _first_match(text, [r"(?:last\s+date|closing\s+date|application\s+last\s+date)\s*[:\-]\s*([^\n]+)"])
+    fields["start_date"] = fields["start_date"] or _first_match(text, [r"(?:start\s+date|starting\s+date|application\s+start\s+date)\s*[:\-]\s*([^\n]+)"])
+    fields["salary"] = fields["salary"] or _first_match(text, [r"(?:salary|pay\s+scale|pay\s+level)\s*[:\-]\s*([^\n]+)"])
+    fields["fee"] = fields["fee"] or _first_match(text, [r"(?:application\s+fee|exam\s+fee)\s*[:\-]\s*([^\n]+)"])
+    return fields
+
+
 def scrape_job_details(url):
     data = {
-        "title": "",
-        "slug": "",
-        "post_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "total_vacancies": "Various Posts",
-        "qualification": "10th / 12th / Graduate",
-        "age_limit": "18 to 35 Years",
-        "last_date": "Check Official Portal",
-        "image": DEFAULT_FALLBACK_IMAGE,
-        "raw_text": "",
-        "apply_url": "",
-        "pdf_url": "",
-        "category": "Latest Jobs"
+        "title": "", "slug": "", "post_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "total_vacancies": "", "qualification": "", "age_limit": "", "last_date": "",
+        "start_date": "", "salary": "", "fee": "", "selection_process": "",
+        "department": "", "post_name": "", "image": DEFAULT_FALLBACK_IMAGE,
+        "raw_text": "", "source_url": url, "apply_url": "", "pdf_url": "",
+        "official_site": "", "category": "Latest Jobs"
     }
 
     session = requests.Session()
     session.headers.update(HEADERS)
 
     try:
-        res = session.get(url, timeout=20)
+        res = session.get(url, timeout=30, allow_redirects=True)
+        res.raise_for_status()
         soup = BeautifulSoup(res.content, "html.parser")
 
-        title_elem = soup.find("h1") or soup.find("h2", {"class": "entry-title"}) or soup.find("meta", {"property": "og:title"})
+        title_elem = soup.find("h1") or soup.find("h2", {"class": "entry-title"}) or soup.find("meta", {"property": "og:title"}) or soup.find("title")
         if title_elem:
-            raw_title = title_elem.get("content") if title_elem.name == "meta" else title_elem.get_text()
-            data["title"] = re.sub(r"\s*-\s*FreeJobAlert.*$", "", raw_title, flags=re.IGNORECASE).strip()
+            raw_title = title_elem.get("content") if title_elem.name == "meta" else title_elem.get_text(" ", strip=True)
+            data["title"] = re.sub(r"\s*[-|]\s*FreeJobAlert.*$", "", raw_title, flags=re.IGNORECASE).strip()
             data["slug"] = slugify(data["title"])
 
-        entry_content = soup.find("div", {"class": "entry-content"}) or soup.find("article")
+        entry_content = soup.find("div", {"class": "entry-content"}) or soup.find("article") or soup.body
         if entry_content:
-            data["raw_text"] = entry_content.get_text(separator="\n", strip=True)[:3000]
+            data["raw_text"] = entry_content.get_text(separator="\n", strip=True)
 
-            vac_match = re.search(r'Total\s+Vacanc[y|ies]\s*:\s*(\d+)', data["raw_text"], re.IGNORECASE)
-            if vac_match:
-                data["total_vacancies"] = vac_match.group(1)
+        data.update(_extract_structured_fields(soup, data["raw_text"]))
 
-            date_match = re.search(r'Last\s+Date\s*:\s*([\d\-\/]+|[A-Za-z0-9\s]+202\d)', data["raw_text"], re.IGNORECASE)
-            if date_match:
-                data["last_date"] = date_match.group(1).strip()
+        image = entry_content.find("img") if entry_content else None
+        if image and image.get("src"):
+            data["image"] = _normalize_url(res.url, image.get("src"))
 
-        data["apply_url"] = url
-        data["pdf_url"] = url
+        for a in soup.find_all("a", href=True):
+            href = _normalize_url(res.url, a.get("href"))
+            kind = _classify_link(a.get_text(" ", strip=True), href)
+            if kind == "notification" and not data["pdf_url"]:
+                data["pdf_url"] = href
+            elif kind == "apply" and not data["apply_url"]:
+                data["apply_url"] = href
+            elif kind == "website" and not data["official_site"]:
+                data["official_site"] = href
+
+        for a in soup.find_all("a", href=True):
+            href = _normalize_url(res.url, a.get("href"))
+            if href.lower().split("?")[0].endswith(".pdf") and not data["pdf_url"]:
+                data["pdf_url"] = href
 
         title_lower = data["title"].lower()
-        if any(keyword in title_lower for keyword in ["admit card", "hall ticket", "call letter", "city intimation"]):
+        if any(k in title_lower for k in ["admit card", "hall ticket", "call letter", "city intimation"]):
             data["category"] = "Admit Card"
-        elif any(keyword in title_lower for keyword in ["result", "scorecard", "merit list", "selection list", "cut off"]):
+        elif any(k in title_lower for k in ["result", "scorecard", "merit list", "selection list", "cut off"]):
             data["category"] = "Result"
-        elif any(keyword in title_lower for keyword in ["answer key", "response sheet"]):
+        elif any(k in title_lower for k in ["answer key", "response sheet"]):
             data["category"] = "Answer Key"
-        else:
-            data["category"] = "Latest Jobs"
+
+        logging.info("Extracted facts: vacancies=%r qualification=%r age=%r start=%r last=%r salary=%r fee=%r notification=%r apply=%r",
+                     data["total_vacancies"], data["qualification"], data["age_limit"], data["start_date"],
+                     data["last_date"], data["salary"], data["fee"], data["pdf_url"], data["apply_url"])
 
     except Exception as e:
         logging.error(f"Scraping Error: {e}")
+        raise RuntimeError(f"Source page scrape failed: {e}") from e
 
     if not data["title"]:
-        data["title"] = "Latest Government Job Recruitment Notification 2026"
-        data["slug"] = f"govt-job-{int(time.time())}"
+        raise RuntimeError("Source page se job title nahi mila; publish roka gaya.")
 
     return data
+
+
+def validate_job_data(job):
+    problems = []
+    if not job.get("title"):
+        problems.append("title missing")
+    if not job.get("raw_text"):
+        problems.append("source article text missing")
+
+    forbidden = {
+        "total_vacancies": ["Various Posts", "Various"],
+        "qualification": ["10th / 12th / Graduate"],
+        "age_limit": ["18 to 35 Years"],
+        "last_date": ["Check Official Portal"]
+    }
+    for field, values in forbidden.items():
+        if job.get(field) in values:
+            problems.append(f"fabricated fallback in {field}")
+
+    if job.get("pdf_url") and "freejobalert.com/articles/" in job["pdf_url"].lower():
+        problems.append("notification link points to FreeJobAlert article")
+    if job.get("apply_url") and "freejobalert.com/articles/" in job["apply_url"].lower():
+        problems.append("apply link points to FreeJobAlert article")
+
+    if job.get("category") == "Latest Jobs" and not any(
+        job.get(x) for x in ["total_vacancies", "qualification", "last_date", "age_limit", "salary", "start_date"]
+    ):
+        problems.append("no structured recruitment facts extracted")
+
+    if problems:
+        raise RuntimeError("Publish validation failed: " + "; ".join(problems))
 
 
 def get_ai_response(prompt):
@@ -133,24 +258,7 @@ def get_ai_response(prompt):
 
 
 def _guess_official_site(title: str) -> str:
-    """Title se common boards/commission ka official domain guess karta hai."""
-    t = title.lower()
-    mapping = [
-        (["hpsc", "haryana public service"], "https://hpsc.gov.in"),
-        (["uppsc", "uttar pradesh public service"], "https://uppsc.up.nic.in"),
-        (["bpsc", "bihar public service"], "https://www.bpsc.bih.nic.in"),
-        (["mpsc", "maharashtra public service"], "https://mpsc.gov.in"),
-        (["rrb", "railway recruitment"], "https://www.rrbcdg.gov.in"),
-        (["ssc", "staff selection commission"], "https://ssc.gov.in"),
-        (["upsc"], "https://www.upsc.gov.in"),
-        (["ibps"], "https://www.ibps.in"),
-        (["ctet", "cbse"], "https://ctet.nic.in"),
-        (["neet", "nnta"], "https://neet.nta.nic.in"),
-        (["jee"], "https://jeemain.nta.nic.in"),
-    ]
-    for keys, url in mapping:
-        if any(k in t for k in keys):
-            return url
+    # Disabled: official domains must come from actual source links.
     return ""
 
 
@@ -176,7 +284,7 @@ def generate_full_html_page(job, ai_content):
         link2_label = "Apply Online Link"
         meta_label = "Last Date"
 
-    official_site = _guess_official_site(job['title'])
+    official_site = job.get('official_site', '')
     # Links table – user ke requested format jaisa
     links_rows = []
     if official_site:
@@ -185,14 +293,21 @@ def generate_full_html_page(job, ai_content):
             f'<tr><td style="padding:10px;"><b>Official Website</b></td>'
             f'<td style="padding:10px;"><a href="{official_site}" target="_blank" rel="noopener noreferrer">{domain}</a></td></tr>'
         )
-    links_rows.append(
-        f'<tr><td style="padding:10px;"><b>{link1_label}</b></td>'
-        f'<td style="padding:10px;"><a href="{job["pdf_url"]}" target="_blank" rel="noopener noreferrer">Check Here</a></td></tr>'
-    )
-    links_rows.append(
-        f'<tr><td style="padding:10px;"><b>{link2_label}</b></td>'
-        f'<td style="padding:10px;"><a href="{job["apply_url"]}" target="_blank" rel="noopener noreferrer">Check Here</a></td></tr>'
-    )
+    if job.get("pdf_url"):
+        links_rows.append(
+            f'<tr><td style="padding:10px;"><b>{link1_label}</b></td>'
+            f'<td style="padding:10px;"><a href="{job["pdf_url"]}" target="_blank" rel="noopener noreferrer">Check Here</a></td></tr>'
+        )
+    if job.get("apply_url"):
+        links_rows.append(
+            f'<tr><td style="padding:10px;"><b>{link2_label}</b></td>'
+            f'<td style="padding:10px;"><a href="{job["apply_url"]}" target="_blank" rel="noopener noreferrer">Check Here</a></td></tr>'
+        )
+    if not links_rows:
+        links_rows.append(
+            f'<tr><td style="padding:10px;"><b>Source</b></td>'
+            f'<td style="padding:10px;"><a href="{job["source_url"]}" target="_blank" rel="noopener noreferrer">View Source Article</a></td></tr>'
+        )
 
     links_table = f"""
 <table border="1" style="width:100%; border-collapse:collapse; margin:28px 0; font-size:0.95rem;">
