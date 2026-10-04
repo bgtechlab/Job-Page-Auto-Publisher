@@ -679,96 +679,34 @@ STRICT RULES (MUST FOLLOW):
     ai_html_body = re.sub(r"<p>```.*?</p>", "", ai_html_body, flags=re.DOTALL)
     ai_html_body = ai_html_body.strip()
 
-    # High-quality generic fallback if AI fails (title + category based)
+    # If AI is unavailable, publish only a factual source-based summary.
+    # Never invent application steps, dates, fees, age limits or other facts.
     if not ai_html_body or len(ai_html_body) < 100:
-        cat = job['category']
-        if cat == "Result":
-            how_title = f"How to Check {job['title']}"
-            how_steps = """
-  <li>Official website par jaayein (neeche Important Links me diya gaya hai).</li>
-  <li>Result / Final Result link par click karein.</li>
-  <li>Registration Number / Roll Number aur Date of Birth enter karein.</li>
-  <li>Captcha fill karke Submit button dabayein.</li>
-  <li>Result download karke print nikaal lein ya save kar lein.</li>
-"""
-            intro = f"<p>{job['title']} release ho chuka hai. Candidates neeche diye gaye steps follow karke apna result check kar sakte hain.</p>"
-            instructions = """
-  <li>Result ke saath original Photo ID proof rakh lein verification ke liye.</li>
-  <li>Cut-off aur merit list carefully check karein.</li>
-  <li>Koi bhi galat information hone par official helpline se contact karein.</li>
-"""
-        elif cat == "Admit Card":
-            how_title = f"How to Download {job['title']}"
-            how_steps = """
-  <li>Official website par jaayein.</li>
-  <li>Admit Card / Hall Ticket link par click karein.</li>
-  <li>Registration Number / Roll Number aur Date of Birth enter karein.</li>
-  <li>Captcha fill karke Submit button dabayein.</li>
-  <li>Admit Card download karke print nikaal lein.</li>
-"""
-            intro = f"<p>{job['title']} available ho gaya hai. Candidates neeche diye gaye steps follow karke apna admit card download kar sakte hain.</p>"
-            instructions = """
-  <li>Admit Card ke saath original Photo ID proof zaroor lein.</li>
-  <li>Exam centre time se 1 ghanta pehle pahunch jaayein.</li>
-  <li>Mobile phone, calculator ya koi electronic device allowed nahi hai.</li>
-"""
-        else:
-            how_title = f"How to Apply / Download – {job['title']}"
-            how_steps = """
-  <li>Official website par jaayein (neeche Important Links me diya gaya hai).</li>
-  <li>Notification / Apply Online link par click karein.</li>
-  <li>Required details carefully fill karein.</li>
-  <li>Documents upload karein aur fee (agar applicable) pay karein.</li>
-  <li>Application form download / print karke safe rakh lein.</li>
-"""
-            intro = f"<p>{job['title']} related update available hai. Candidates neeche diye gaye steps follow karke complete details dekh sakte hain.</p>"
-            instructions = """
-  <li>Hamesha official website se hi apply / download karein.</li>
-  <li>Last date se pehle form submit kar lein.</li>
-  <li>Personal details aur documents carefully check karein.</li>
-"""
-
-        ai_html_body = f"""
-<h2>Overview</h2>
-{intro}
-
-<table border="1" style="width:100%; border-collapse:collapse; margin:20px 0; font-size:0.95rem;">
-  <tr style="background:#f1f5f9;">
-    <th style="padding:10px; text-align:left;">Particulars</th>
-    <th style="padding:10px; text-align:left;">Details</th>
-  </tr>
-  <tr>
-    <td style="padding:10px;"><b>Exam / Notification</b></td>
-    <td style="padding:10px;">{job['title']}</td>
-  </tr>
-  <tr>
-    <td style="padding:10px;"><b>Category</b></td>
-    <td style="padding:10px;">{job['category']}</td>
-  </tr>
-  <tr>
-    <td style="padding:10px;"><b>Total Vacancies</b></td>
-    <td style="padding:10px;">{job['total_vacancies']}</td>
-  </tr>
-  <tr>
-    <td style="padding:10px;"><b>Date / Status</b></td>
-    <td style="padding:10px;">{job['last_date']}</td>
-  </tr>
-  <tr>
-    <td style="padding:10px;"><b>Qualification</b></td>
-    <td style="padding:10px;">{job['qualification']}</td>
-  </tr>
-</table>
-
-<h2>{how_title}</h2>
-<ol>
-{how_steps}
-</ol>
-
-<h2>Important Instructions</h2>
-<ul>
-{instructions}
-</ul>
-"""
+        rows = [
+            ("Total Vacancies", job["total_vacancies"] or "Not mentioned in source"),
+            ("Start Date", job["start_date"] or "Not mentioned in source"),
+            ("Last Date", job["last_date"] or "Not mentioned in source"),
+            ("Qualification", job["qualification"] or "Not mentioned in source"),
+            ("Age Limit", job["age_limit"] or "Not mentioned in source"),
+            ("Salary / Pay Scale", job["salary"] or "Not mentioned in source"),
+            ("Application Fee", job["fee"] or "Not mentioned in source"),
+            ("Department", job["department"] or "Not mentioned in source"),
+            ("Post Name", job["post_name"] or "Not mentioned in source")
+        ]
+        table_rows = "".join(
+            f'<tr><td style="padding:10px;"><b>{label}</b></td><td style="padding:10px;">{value}</td></tr>'
+            for label, value in rows
+        )
+        ai_html_body = (
+            f"<h2>Overview</h2><p>{job['title']} ki available source information neeche di gayi hai. "
+            "Jis detail ka source article me clear mention nahi hai, use guess nahi kiya gaya hai.</p>"
+            '<table border="1" style="width:100%; border-collapse:collapse; margin:20px 0; font-size:0.95rem;">'
+            '<tr style="background:#f1f5f9;"><th style="padding:10px;text-align:left;">Particulars</th>'
+            '<th style="padding:10px;text-align:left;">Details</th></tr>'
+            f"{table_rows}</table>"
+            "<h2>Source Information</h2>"
+            f'<p>Source article: <a href="{job["source_url"]}" target="_blank" rel="noopener noreferrer">View Source</a></p>'
+        )
 
     full_html = generate_full_html_page(job, ai_html_body)
 
@@ -784,6 +722,16 @@ STRICT RULES (MUST FOLLOW):
         "vacancies": job["total_vacancies"],
         "qualification": job["qualification"],
         "last_date": job["last_date"],
+        "start_date": job["start_date"],
+        "age_limit": job["age_limit"],
+        "salary": job["salary"],
+        "fee": job["fee"],
+        "department": job["department"],
+        "post_name": job["post_name"],
+        "notification_url": job["pdf_url"],
+        "apply_url": job["apply_url"],
+        "official_site": job["official_site"],
+        "source_url": job["source_url"],
         "category": job["category"],
         "page_url": page_url,
         "post_date": job["post_date"]
