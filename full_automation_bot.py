@@ -1281,6 +1281,18 @@ async def _notify_telegram_plain(message: str):
         logging.error(f"Telegram notify failed: {e}")
 
 
+def _check_input_url(url):
+    """Galat paste hue link (jaise ek link ke beech me doosra link) ko pehle hi pakad leta hai."""
+    if len(re.findall(r"https?://", url, flags=re.IGNORECASE)) > 1:
+        return "Link me do URL mil gaye (ek link ke beech me doosra link paste ho gaya)."
+    if re.search(r"\s", url):
+        return "Link me space hai."
+    host = _host(url)
+    if "." not in host or not re.fullmatch(r"[a-z0-9.-]+", host):
+        return f"Link ka domain galat hai: {host}"
+    return ""
+
+
 if __name__ == "__main__":
     import sys
 
@@ -1293,6 +1305,15 @@ if __name__ == "__main__":
         url_input = input("Enter Source Job URL: ").strip()
 
     if url_input.startswith("http"):
+        problem = _check_input_url(url_input)
+        if problem:
+            print(problem)
+            asyncio.run(_notify_telegram_plain(
+                f"⚠️ <b>Galat URL</b>\n{_esc(problem, quote=False)}\n"
+                f"<code>{_esc(url_input[:300], quote=False)}</code>\n"
+                "Link dobara saaf paste karke workflow chalayein."
+            ))
+            raise SystemExit(1)
         try:
             asyncio.run(process_and_publish(url_input))
         except Exception as e:
