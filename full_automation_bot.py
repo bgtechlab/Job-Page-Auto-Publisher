@@ -7,7 +7,7 @@ import os
 import re
 import time
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
-from bs4 import BeautifulSoup, Comment
+from bs4 import BeautifulSoup, Comment, NavigableString
 from dotenv import load_dotenv
 from g4f.client import Client
 from github import Github, Auth, GithubException, UnknownObjectException
@@ -45,7 +45,7 @@ RETRY_DELAY_SECONDS = 2
 # Jab koi detail source me na mile to page par yahi dikhega
 COMING_SOON = "Coming Soon"
 
-# AI ke liye models (ek ke baad ek try hote hain) aur kitne round retry karne hain
+# AI ke liye models (ek ke baad ek try hote hain)
 AI_MODELS = ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"]
 
 FIELD_KEYS = [
@@ -81,19 +81,69 @@ SITE_NAME_RE = re.compile(
     r"(?:\.com(?:\.cm)?|\.in|\.net|\.org)?\b"
 )
 
-# Source page ki aisi lines jo AI ko nahi bhejni (promo / social / source site ka naam)
+# Source page ki aisi lines jo page par / AI ko nahi jani chahiye (promo, social, source site ka naam)
 JUNK_LINE_RE = re.compile(
     r"(?i)(telegram|whatsapp|join\s+(?:us|our|now)|follow\s+us|subscribe|youtube\s+channel|facebook|instagram|"
     r"free\s*job\s*alert|freejobalert|sarkari\s*result|sarkariresult|sarkari\s*exam|download\s+(?:our\s+)?app|"
-    r"share\s+this|click\s+here\s+to\s+join|copyright|all\s+rights\s+reserved|disclaimer\s*:)"
+    r"share\s+this|click\s+here\s+to|copyright|all\s+rights\s+reserved|disclaimer\s*:|"
+    r"job\s+alerts?|never\s+miss|register\s+for|daily\s+quiz|mock\s+test|take\s+today|"
+    r"you\s+may\s+also|also\s+read|read\s+more|preferred\s+source|add\s+us\s+on)"
 )
 
-# AI ne "N/A", "Not mentioned" jaisa likha to use "Coming Soon" bana dete hain
-EMPTY_CELL_RE = re.compile(
-    r"^\s*(?:n/?a|na|not\s+available|not\s+mentioned(?:\s+in\s+(?:the\s+)?source)?|not\s+specified|not\s+declared|"
-    r"tba|tbd|to\s+be\s+(?:announced|notified|declared)|updating\s+soon)\s*\.?\s*$",
-    re.IGNORECASE,
+# In values ka matlab "jaankari abhi nahi hai" -> Coming Soon
+EMPTY_VALUES = {
+    "n/a", "na", "not available", "not mentioned", "various", "various posts", "tba", "tbd",
+    "to be announced", "coming soon", "update soon", "updating soon", "-", "--", "notify later",
+    "will be updated here soon", "will be updated soon", "to be notified", "soon",
+    "click here", "check here", "download here", "click here to download", "apply now", "download", "here", "link",
+}
+NOT_STATED_RE = re.compile(r"(?i)\b(?:not|no)\b[^.]{0,40}\b(?:mentioned|specified|declared|available|notified|given|stated)\b")
+WEAK_RE = re.compile(
+    r"(?i)^\s*(?:as\s+per|refer|check|see|read)\b.{0,60}\b(?:notification|advertis\w*|advt|cen|official|detail\w*|rules?|norms?)\b"
 )
+
+HEADINGS = ["h1", "h2", "h3", "h4", "h5", "h6"]
+INLINE_TAGS = {"a", "strong", "b", "em", "i", "span", "u", "small", "mark", "font", "sup", "sub", "br", "code", "abbr", "label"}
+BLOCK_CONTAINERS = {"div", "section", "article", "main", "center", "figure", "details", "summary", "blockquote",
+                    "dl", "dd", "dt", "tbody", "thead", "header"}
+SKIP_TAGS = {"script", "style", "noscript", "iframe", "img", "svg", "picture", "button", "input", "select", "textarea", "nav", "footer", "aside"}
+
+# Section heading -> kind. Upar wale rule pehle check hote hain.
+SECTION_RULES = [
+    ("stop", r"related posts|latest posts|other posts|you might|latest updates|about the author|connect with us|leave a (?:reply|comment)|"
+             r"disclaimer|most viewed|job notifications|jobs by|free mock|last date reminder|have a question"),
+    ("pattern", r"exam pattern|physical standard|physical|exam scheme"),
+    ("skip", r"\bjoin\b|follow |telegram|whatsapp|download .*app|important links|useful (?:important )?links|useful links|notification pdf|"
+             r"syllabus|quiz|register|alert|discuss|report an error|share"),
+    ("dates", r"\bdates?\b|schedule|timeline"),
+    ("fee", r"\bfee\b|\bfees\b|payment"),
+    ("age", r"\bage\b"),
+    ("eligibility", r"eligib|qualification|education"),
+    ("selection", r"selection|select candidates|how will"),
+    ("documents", r"document"),
+    ("apply", r"how to (?:apply|fill|check|download)|steps to"),
+    ("vacancy", r"vacanc|post wise|posts? details|total post|category wise|reservation"),
+    ("pay", r"salary|pay scale|stipend|pay level|pay matrix"),
+    ("keypoints", r"key points|highlights"),
+    ("overview", r"overview|quick summary|short details|summary|details"),
+    ("other", r"other (?:points|conditions|important)|\bnotes?\b|instruction|conditions|relaxation"),
+]
+
+SECTION_ORDER = [
+    ("overview", "Overview"),
+    ("dates", "Important Dates"),
+    ("vacancy", "Vacancy Details"),
+    ("eligibility", "Eligibility / Qualification"),
+    ("age", "Age Limit"),
+    ("fee", "Application Fee"),
+    ("pay", "Salary / Pay Scale"),
+    ("selection", "Selection Process"),
+    ("documents", "Documents Required"),
+    ("pattern", "Exam Pattern & Other Details"),
+    ("other", "Other Important Points"),
+]
+
+TABLE_STYLE = 'border="1" style="width:100%; border-collapse:collapse; margin:20px 0; font-size:0.95rem;"'
 
 _REDIRECT_CACHE = {}
 _REDIRECT_BUDGET = {"left": 25}
@@ -115,6 +165,10 @@ def _esc(value, quote=True):
     return htmllib.escape(str(value if value is not None else ""), quote=quote)
 
 
+def _html_text(value):
+    return _esc(value).replace("\n", "<br>")
+
+
 def _cs(value):
     """Khaali value ki jagah 'Coming Soon' dikhane ke liye."""
     value = (str(value).strip() if value is not None else "")
@@ -124,13 +178,27 @@ def _cs(value):
 def _clean_value(value):
     if value is None:
         return ""
-    value = re.sub(r"\s+", " ", str(value)).strip(" :|-–—")
-    if not value or value.lower() in {
-        "n/a", "na", "not available", "not mentioned", "various", "various posts", "tba", "tbd",
-        "to be announced", "coming soon", "update soon", "updating soon", "-", "--",
-    }:
+    value = re.sub(r"\s+", " ", str(value)).strip()
+    value = re.sub(r"^[\s:|\-–—]+", "", value)
+    value = re.sub(r"(?<!/)[\s:|\-–—]+$", "", value)
+    if not value or value.lower() in EMPTY_VALUES:
+        return ""
+    if len(value) <= 120 and NOT_STATED_RE.search(value):
         return ""
     return value
+
+
+def _is_weak(value):
+    return bool(value) and len(value) < 120 and bool(WEAK_RE.search(value))
+
+
+def _display_cell(text, cs=True):
+    t = (text or "").strip()
+    if not t:
+        return COMING_SOON if cs else "-"
+    if cs and not _clean_value(t):
+        return COMING_SOON
+    return t
 
 
 def _first_match(text, patterns, max_len=300):
@@ -206,6 +274,20 @@ def _strip_site_names(text):
     return re.sub(r"[ \t]{2,}", " ", text)
 
 
+def _extract_explicit_urls(text):
+    return re.findall(r'https?://[^\s<>"\']+', text or "", flags=re.IGNORECASE)
+
+
+def _safe_text(t):
+    """Page par daalne layak text. Junk / source-site wali line ho to khaali string."""
+    t = re.sub(r"[ \t]+", " ", t or "").strip()
+    if not t or JUNK_LINE_RE.search(t):
+        return ""
+    if any(_is_blocked_url(u) for u in _extract_explicit_urls(t)):
+        return ""
+    return _strip_site_names(t).strip()
+
+
 def _unwrap_redirect_param(href):
     try:
         qs = parse_qs(urlparse(href).query)
@@ -255,11 +337,15 @@ def _kind_from_label(label):
         return "answer_key"
     if any(x in t for x in ["result", "scorecard", "score card", "merit list", "selection list", "cut off", "cutoff"]):
         return "result"
+    if any(x in t for x in ["notification", "advertisement", "advt", "brochure", "download pdf"]):
+        return "notification"
+    if any(x in t for x in ["notice", "corrigendum", "circular"]):
+        return "notice"
+    if any(x in t for x in ["syllabus", "exam pattern"]):
+        return "syllabus"
     if any(x in t for x in ["apply online", "online application", "apply now", "application form",
                             "registration", "apply link", "login", "apply"]):
         return "apply"
-    if any(x in t for x in ["notification", "advertisement", "advt", "notice", "brochure", "download pdf"]):
-        return "notification"
     if any(x in t for x in ["official website", "official site", "official portal", "official web",
                             "website", "home page", "homepage"]):
         return "website"
@@ -277,18 +363,14 @@ def _classify_link(label, href, source_url=""):
     if not kind:
         path = href.lower().split("?")[0]
         if path.endswith(".pdf"):
-            kind = "notification"
+            kind = "notice"
         elif _is_official_domain(href):
             kind = "website"
     return kind
 
 
-def _extract_explicit_urls(text):
-    return re.findall(r'https?://[^\s<>"\']+', text or "", flags=re.IGNORECASE)
-
-
 def _collect_link_candidates(scope, base_url):
-    """(label, href) pairs. Table me row ka pehla cell label banta hai ("Click Here" ke bajaay)."""
+    """Link candidates. Table me row ka pehla cell label banta hai ("Click Here" ke bajaay)."""
     cands = []
     seen = set()
 
@@ -306,19 +388,23 @@ def _collect_link_candidates(scope, base_url):
                 continue
             a_text = a.get_text(" ", strip=True)
             in_first = any(a is x for x in first_cell_anchors)
-            label = a_text if in_first else f"{row_label} {a_text}"
-            cands.append((label, _normalize_url(base_url, a.get("href"))))
+            cands.append({
+                "label": a_text if in_first else f"{row_label} {a_text}",
+                "title": a_text if in_first else row_label,
+                "href": _normalize_url(base_url, a.get("href")),
+            })
             seen.add(id(a))
 
     for a in scope.find_all("a", href=True):
         if id(a) in seen or not ok_href(a.get("href")):
             continue
-        label = a.get_text(" ", strip=True)
+        a_text = a.get_text(" ", strip=True)
+        label = a_text
         parent = a.parent
         ptxt = re.sub(r"\s+", " ", parent.get_text(" ", strip=True)) if parent else ""
         if ptxt and len(ptxt) <= 120:
             label = ptxt
-        cands.append((label, _normalize_url(base_url, a.get("href"))))
+        cands.append({"label": label, "title": a_text or label, "href": _normalize_url(base_url, a.get("href"))})
     return cands
 
 
@@ -326,18 +412,41 @@ def _first(items):
     return items[0] if items else ""
 
 
+GENERIC_LINK_TITLES = {
+    "notice": "Official Notice", "syllabus": "Syllabus & Exam Pattern", "notification": "Official Notification",
+    "apply": "Apply Online", "result": "Result", "admit": "Admit Card", "answer_key": "Answer Key",
+}
+
+
+def _link_title(title, kind):
+    t = _strip_site_names(re.sub(r"\s+", " ", title or "")).strip(" :-|")
+    if t.lower() in ("", "click here", "here", "download", "link", "check here", "click here to download"):
+        return GENERIC_LINK_TITLES.get(kind, "Official Link")
+    return t[:120]
+
+
 def _extract_links(scope, base_url, source_url, category, session=None):
-    found = {"notification": [], "apply": [], "result": [], "admit": [], "answer_key": [], "website": []}
-    for label, href in _collect_link_candidates(scope, base_url):
+    kinds = ("notification", "notice", "syllabus", "apply", "result", "admit", "answer_key", "website")
+    found = {k: [] for k in kinds}
+    resolved = []
+    for cand in _collect_link_candidates(scope, base_url):
+        label, href = cand["label"], cand["href"]
         if _kind_from_label(label) or _is_shortener(href):
             href = _resolve_redirect(href, session)
         kind = _classify_link(label, href, source_url)
         if kind:
             found[kind].append(href)
+            resolved.append((kind, cand["title"], href))
 
     expected = {"Result": "result", "Admit Card": "admit", "Answer Key": "answer_key"}.get(category, "apply")
+    pdf_url = _first(found["notification"])
+    if not pdf_url:
+        for h in found["notice"]:
+            if re.search(r"notification|advt|advertis", h.lower()):
+                pdf_url = h
+                break
     links = {
-        "pdf_url": _first(found["notification"]),
+        "pdf_url": pdf_url,
         "apply_url": _first(found[expected]),
         "official_site": _first(found["website"]),
     }
@@ -350,6 +459,21 @@ def _extract_links(scope, base_url, source_url, category, session=None):
                 p = urlparse(u)
                 links["official_site"] = f"{p.scheme}://{p.netloc}/"
                 break
+
+    # Baaki official notices / PDFs (corrigendum, roster, syllabus PDF, ...) -> extra rows
+    used = {v for v in links.values() if v}
+    extras, seen_hrefs = [], set()
+    for kind, title, href in resolved:
+        if kind == "website" or href in used or href in seen_hrefs:
+            continue
+        path = href.lower().split("?")[0]
+        if not (_is_official_domain(href) or path.endswith(".pdf")):
+            continue
+        seen_hrefs.add(href)
+        extras.append((_link_title(title, kind), href))
+        if len(extras) >= 8:
+            break
+    links["extra_links"] = extras
     return links
 
 
@@ -358,6 +482,8 @@ def _assign_field(fields, key, value):
     key = re.sub(r"\s+", " ", (key or "").lower()).strip(" :-|")
     value = _clean_value(value)
     if not key or not value or len(key) > 60 or len(value) > 600:
+        return
+    if value.lower() in {"eligibility criteria", "details", "particulars", "description", "date", "link", "event"}:
         return
 
     if any(x in key for x in ["total vacanc", "total post", "no. of vacanc", "no of vacanc", "number of vacanc",
@@ -369,10 +495,11 @@ def _assign_field(fields, key, value):
         name = "age_limit"
     elif any(x in key for x in ["last date", "closing date", "end date", "last day", "apply last", "application end"]):
         name = "last_date"
-    elif any(x in key for x in ["start date", "starting date", "application start", "application begin",
-                                "apply start", "begin date", "date of start"]):
+    elif any(x in key for x in ["start date", "starting date", "application start", "application begin", "apply start",
+                                "begin date", "date of start", "opening date", "open date", "application opens",
+                                "starts from", "starting from"]):
         name = "start_date"
-    elif any(x in key for x in ["salary", "pay scale", "pay level", "pay matrix", "stipend"]):
+    elif any(x in key for x in ["salary", "pay scale", "pay level", "pay matrix", "stipend"]) or re.match(r"^pay\b", key):
         name = "salary"
     elif any(x in key for x in ["application fee", "exam fee", "fee"]):
         name = "fee"
@@ -385,23 +512,48 @@ def _assign_field(fields, key, value):
     else:
         return
 
+    if re.search(r"\bnotice\b|\bnotification\b|\blink\b", key) and name != "total_vacancies":
+        return
+    if name in ("last_date", "start_date") and re.search(r"fee|payment|correction|modif|edit|withdraw", key):
+        return
     if name == "total_vacancies" and (not re.search(r"\d", value) or len(value) > 80):
         return
     if name in ("last_date", "start_date") and len(value) > 200:
         return
-    if not fields[name]:
+
+    cur = fields[name]
+    if not cur or (_is_weak(cur) and not _is_weak(value)):
         fields[name] = value
+
+
+def _bold_ratio(tag):
+    text = re.sub(r"\W", "", tag.get_text("", strip=True))
+    if not text:
+        return 0.0
+    bold = re.sub(r"\W", "", "".join(b.get_text("", strip=True) for b in tag.find_all(["strong", "b"])))
+    return len(bold) / len(text)
+
+
+def _is_bold_only(tag):
+    return _bold_ratio(tag) >= 0.9
+
+
+def _cell_is_bold(c):
+    return c.name == "th" or _is_bold_only(c)
 
 
 def _extract_structured_fields(scope, text, title=""):
     fields = {k: "" for k in FIELD_KEYS}
 
-    # 1) Table rows: key | value
+    # 1) Table rows: key | value (header rows chhod kar)
     for table in scope.find_all("table"):
-        for tr in table.find_all("tr"):
-            cells = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
-            if len(cells) < 2:
+        for idx, tr in enumerate(table.find_all("tr")):
+            cell_tags = tr.find_all(["th", "td"])
+            if len(cell_tags) < 2:
                 continue
+            if idx == 0 and all(_cell_is_bold(c) for c in cell_tags):
+                continue
+            cells = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)) for c in cell_tags]
             _assign_field(fields, cells[0], " ".join(cells[1:]))
 
     # 2) List / paragraph lines: "Label: value"
@@ -426,7 +578,12 @@ def _extract_structured_fields(scope, text, title=""):
     fields["age_limit"] = fields["age_limit"] or _first_match(text, [r"age\s+limit\s*[:\-]\s*([^\n]+)"])
     fields["last_date"] = fields["last_date"] or _first_match(text, [r"(?:last\s+date|closing\s+date|application\s+last\s+date)\s*[:\-]\s*([^\n]+)"])
     fields["start_date"] = fields["start_date"] or _first_match(text, [r"(?:start\s+date|starting\s+date|application\s+start\s+date)\s*[:\-]\s*([^\n]+)"])
-    fields["salary"] = fields["salary"] or _first_match(text, [r"(?:salary|pay\s+scale|pay\s+level)\s*[:\-]\s*([^\n]+)"])
+    # Salary: sirf ":" se (nahi to "Pay\nLevel-6" me "Level-" kat jata tha)
+    # Date ke baad agla sentence (jaise ". Total Vacancy: 12") value me na ghuse
+    for _k in ("last_date", "start_date"):
+        if fields[_k]:
+            fields[_k] = _clean_value(re.split(r"\.\s+(?=[A-Z])", fields[_k])[0])
+    fields["salary"] = fields["salary"] or _first_match(text, [r"(?:salary|pay\s+scale)\s*:\s*([^\n]+)"])
     fields["fee"] = fields["fee"] or _first_match(text, [r"(?:application\s+fee|exam\s+fee)\s*[:\-]\s*([^\n]+)"])
     return fields
 
@@ -448,9 +605,14 @@ def _clean_title(raw):
     t = re.sub(r"\s+", " ", raw or "").strip()
     t = re.sub(r"\s*[-|–—:]\s*(?:www\.)?(?:free\s*job\s*alert|sarkari\s*result)[^|]*$", "", t, flags=re.IGNORECASE)
     t = _strip_site_names(t)
+    t = re.sub(r"\s*\(\s*short\s+notice\s*\)", "", t, flags=re.IGNORECASE)
     t = re.sub(r"\s*[-|–—:]\s*$", "", t)
     t = re.sub(r"^\s*[-|–—:]\s*", "", t)
     return t.strip()
+
+
+def _short_title(title):
+    return re.split(r"\s+[-–—|]\s+", title or "", maxsplit=1)[0].strip() or (title or "")
 
 
 def _detect_category(title):
@@ -462,6 +624,274 @@ def _detect_category(title):
     if any(k in title_lower for k in ["answer key", "response sheet"]):
         return "Answer Key"
     return "Latest Jobs"
+
+
+# ================= SECTION-BASED EXTRACTION =================
+def _list_items(ul):
+    """List ke items (nested items alag line ban jate hain)."""
+    items = []
+    for li in ul.find_all("li", recursive=False):
+        own = []
+        nested = []
+        for ch in li.children:
+            if isinstance(ch, NavigableString):
+                own.append(str(ch))
+            elif ch.name in ("ul", "ol"):
+                nested.append(ch)
+            else:
+                own.append(ch.get_text(" ", strip=True))
+        t = re.sub(r"\s+", " ", " ".join(own)).strip()
+        if t:
+            items.append(t)
+        for n in nested:
+            items.extend(_list_items(n))
+    return items
+
+
+def _table_blocks(table):
+    rows = []
+    for tr in table.find_all("tr"):
+        if tr.find_parent("table") is not table:
+            continue
+        cells = tr.find_all(["th", "td"], recursive=False)
+        row = []
+        for c in cells:
+            for br in c.find_all("br"):
+                br.replace_with("\n")
+            for li in c.find_all("li"):
+                li.insert(0, "\n")
+            lines = [re.sub(r"\s+", " ", l).strip() for l in c.get_text(" ").split("\n")]
+            row.append({"t": "\n".join(l for l in lines if l), "b": _cell_is_bold(c)})
+        if row and any(x["t"] for x in row):
+            rows.append(row)
+    if not rows:
+        return []
+
+    ncols = [len(r) for r in rows]
+    blocks = []
+    if all(n == 1 for n in ncols):
+        start = 0
+        first = rows[0][0]
+        if len(rows) > 1 and (first["b"] or len(first["t"]) <= 120) and "\n" not in first["t"]:
+            blocks.append(("heading", first["t"]))
+            start = 1
+        for r in rows[start:]:
+            lines = r[0]["t"].split("\n")
+            blocks.append(("list", lines) if len(lines) > 1 else ("para", lines[0]))
+        return blocks
+
+    if len(rows) > 1 and ncols[0] == 1 and all(n >= 2 for n in ncols[1:]) and "\n" not in rows[0][0]["t"]:
+        blocks.append(("heading", rows[0][0]["t"]))
+        rows = rows[1:]
+    blocks.append(("table", rows))
+    return blocks
+
+
+def _collect_blocks(node):
+    """Content ko (heading / list / table / para) blocks me todta hai, document ke order me."""
+    blocks = []
+    buf = []  # (text, is_link)
+
+    def flush():
+        pieces = [(t, l) for t, l in buf if t.strip()]
+        buf.clear()
+        if not pieces or all(l for _, l in pieces):
+            return  # sirf link text (jaise "Join Now") -> chhod do
+        t = re.sub(r"\s+", " ", " ".join(t for t, _ in pieces)).strip()
+        if t:
+            blocks.append(("para", t))
+
+    for child in node.children:
+        if isinstance(child, Comment):
+            continue
+        if isinstance(child, NavigableString):
+            buf.append((str(child), False))
+            continue
+        name = child.name or ""
+        if name in SKIP_TAGS:
+            continue
+        if name in INLINE_TAGS:
+            buf.append((child.get_text(" ", strip=True), name == "a"))
+            continue
+        flush()
+        if name in HEADINGS:
+            t = re.sub(r"\s+", " ", child.get_text(" ", strip=True))
+            if t:
+                blocks.append(("heading", t))
+        elif name in ("ul", "ol"):
+            items = _list_items(child)
+            if items:
+                blocks.append(("list", items))
+        elif name == "table":
+            blocks.extend(_table_blocks(child))
+        elif name == "p":
+            t = re.sub(r"\s+", " ", child.get_text(" ", strip=True))
+            if not t:
+                continue
+            if _is_bold_only(child) and len(t) <= 90 and not t.endswith("."):
+                blocks.append(("heading", t.rstrip(": ")))
+            elif not all(ch.name == "a" for ch in child.find_all(True, recursive=False)) or len(child.find_all(True, recursive=False)) == 0:
+                blocks.append(("para", t))
+        elif name in BLOCK_CONTAINERS:
+            blocks.extend(_collect_blocks(child))
+        else:
+            t = re.sub(r"\s+", " ", child.get_text(" ", strip=True))
+            if t:
+                blocks.append(("para", t))
+    flush()
+    return blocks
+
+
+def _drop_faq_blocks(blocks):
+    """Source ke FAQ / Q&A blocks hata deta hai (FAQ hum apne facts se khud banate hain)."""
+    out = []
+    in_faq = False
+    for b in blocks:
+        if b[0] == "heading":
+            t = b[1]
+            if re.search(r"(?i)\bfaqs?\b|frequently asked|important question", t):
+                in_faq = True
+                continue
+            if re.match(r"(?i)^\s*q\s*\d+\s*[.:)\-]", t) or (in_faq and t.rstrip().endswith("?")):
+                in_faq = True
+                continue
+            in_faq = False
+            out.append(b)
+            continue
+        if in_faq:
+            continue
+        text = "\n".join(b[1]) if b[0] == "list" else (b[1] if b[0] == "para" else "")
+        if text and re.match(r"(?is)^\s*(?:question|q\d*)\s*[:.\-)]", text):
+            continue
+        out.append(b)
+    return out
+
+
+def _classify_section(title):
+    t = (title or "").lower()
+    for kind, pattern in SECTION_RULES:
+        if re.search(pattern, t):
+            return kind
+    return "unknown"
+
+
+def _build_sections(blocks):
+    """{kind: [blocks_list, ...]}. Sirf pehchane hue sections rakhe jate hain."""
+    sections = {}
+    kind = "intro"
+    current = []
+
+    def commit():
+        if current and kind not in ("skip", "stop", "unknown", "intro"):
+            sections.setdefault(kind, []).append(list(current))
+
+    for b in blocks:
+        if b[0] == "heading":
+            commit()
+            current = []
+            kind = _classify_section(b[1])
+            if kind == "stop":
+                break
+        else:
+            current.append(b)
+    else:
+        commit()
+    return sections
+
+
+def _section_lines(blocks):
+    lines = []
+    for b in blocks:
+        if b[0] == "list":
+            lines.extend(b[1])
+        elif b[0] == "para":
+            lines.append(b[1])
+        elif b[0] == "table":
+            for row in b[1]:
+                lines.append(" : ".join(c["t"].replace("\n", " ") for c in row))
+    return [l for l in (_safe_text(x) for x in lines) if l]
+
+
+def _split_kv(item):
+    if ":" not in item:
+        return None
+    label, _, value = item.partition(":")
+    label, value = label.strip(), value.strip()
+    if 0 < len(label) <= 70 and value:
+        return label, value
+    return None
+
+
+def _kv_pairs(blocks):
+    pairs = []
+    for b in blocks:
+        if b[0] == "list":
+            for it in b[1]:
+                kv = _split_kv(it)
+                if kv:
+                    pairs.append(kv)
+        elif b[0] == "para":
+            kv = _split_kv(b[1])
+            if kv:
+                pairs.append(kv)
+        elif b[0] == "table":
+            rows = b[1]
+            start = 1 if (len(rows) > 1 and len(rows[0]) >= 2 and all(c["b"] for c in rows[0])) else 0
+            for row in rows[start:]:
+                if len(row) >= 2:
+                    pairs.append((row[0]["t"].replace("\n", " "), " ".join(c["t"].replace("\n", " ") for c in row[1:])))
+    return pairs
+
+
+def _fill_from_sections(fields, sections):
+    for blocks in sections.get("dates", []):
+        for label, value in _kv_pairs(blocks):
+            _assign_field(fields, label, value)
+
+    for kind in ("eligibility", "overview", "pay"):
+        for blocks in sections.get(kind, []):
+            for label, value in _kv_pairs(blocks):
+                _assign_field(fields, label, value)
+
+    if not fields["total_vacancies"]:
+        for blocks in sections.get("vacancy", []):
+            for line in _section_lines(blocks):
+                m = re.search(r"\b([0-9][0-9,]{1,})\s*(?:posts?|vacanc(?:y|ies))\b", line, re.IGNORECASE)
+                if m:
+                    fields["total_vacancies"] = m.group(1)
+                    break
+            if fields["total_vacancies"]:
+                break
+
+    if not fields["fee"]:
+        picks = []
+        for blocks in sections.get("fee", []):
+            for l in _section_lines(blocks):
+                if re.search(r"\d|\bnil\b|\bfree\b|exempt", l, re.IGNORECASE) and not re.search(r"payment mode", l, re.IGNORECASE):
+                    picks.append(l)
+        val = _clean_value("; ".join(picks[:3]))
+        if val and len(val) <= 300:
+            fields["fee"] = val
+
+    age_lines = [l for blocks in sections.get("age", []) for l in _section_lines(blocks)
+                 if re.search(r"\d", l) and len(l) <= 160]
+    if age_lines:
+        val = _clean_value("; ".join(age_lines[:4]))
+        cur = fields["age_limit"]
+        if val and len(val) <= 300 and not _is_weak(val) and (not cur or _is_weak(cur) or len(val) > len(cur)):
+            fields["age_limit"] = val
+
+    if not fields["selection_process"]:
+        lines = [l for blocks in sections.get("selection", []) for l in _section_lines(blocks) if len(l) <= 80]
+        val = _clean_value(" → ".join(lines[:8]))
+        if val and len(val) <= 300:
+            fields["selection_process"] = val
+
+    if not fields["qualification"] or _is_weak(fields["qualification"]):
+        for blocks in sections.get("eligibility", []):
+            if any(b[0] == "table" and len(b[1]) >= 3 for b in blocks) and not fields["qualification"]:
+                fields["qualification"] = "Post-wise eligibility (see details below)"
+                break
 
 
 CONTENT_SELECTORS = [".entry-content", ".post-content", ".td-post-content", ".article-content",
@@ -486,7 +916,7 @@ def scrape_job_details(url):
         "start_date": "", "salary": "", "fee": "", "selection_process": "",
         "department": "", "post_name": "", "image": DEFAULT_FALLBACK_IMAGE,
         "raw_text": "", "source_url": url, "apply_url": "", "pdf_url": "",
-        "official_site": "", "category": "Latest Jobs"
+        "official_site": "", "category": "Latest Jobs", "extra_links": [], "sections": {},
     }
 
     _REDIRECT_BUDGET["left"] = 25
@@ -532,7 +962,6 @@ def scrape_job_details(url):
             extra = _extract_structured_fields(soup, data["raw_text"], data["title"])
             for k, v in extra.items():
                 fields[k] = fields[k] or v
-        data.update(fields)
 
         # ---- Image: source site ki image nahi, sirf kisi aur domain ki ----
         image = entry_content.find("img")
@@ -545,9 +974,18 @@ def scrape_job_details(url):
 
         # ---- Links: sirf asli official links ----
         links = _extract_links(entry_content, res.url, url, data["category"], session)
-        if not any(links.values()) and entry_content is not soup:
+        if not any(links.get(k) for k in ("pdf_url", "apply_url", "official_site")) and entry_content is not soup:
             links = _extract_links(soup, res.url, url, data["category"], session)
+        data["extra_links"] = links.pop("extra_links", [])
         data.update({k: v for k, v in links.items() if v})
+
+        # ---- Sections (dates, fee, age, eligibility, selection, documents ...) ----
+        # NOTE: yeh tree me <br> / <li> badalta hai, isliye links aur fields ke BAAD chalta hai
+        blocks = _drop_faq_blocks(_collect_blocks(entry_content))
+        sections = _build_sections(blocks)
+        _fill_from_sections(fields, sections)
+        data["sections"] = sections
+        data.update(fields)
 
         # Kuch pages me official links sirf plain text me hote hain
         category_keywords = {
@@ -567,9 +1005,10 @@ def scrape_job_details(url):
             elif _is_likely_official_url(href) and _is_official_domain(href) and not data["official_site"]:
                 data["official_site"] = href
 
-        logging.info("Extracted facts: vacancies=%r qualification=%r age=%r start=%r last=%r salary=%r fee=%r notification=%r apply=%r",
+        logging.info("Extracted facts: vacancies=%r qualification=%r age=%r start=%r last=%r salary=%r fee=%r selection=%r notification=%r apply=%r sections=%s",
                      data["total_vacancies"], data["qualification"], data["age_limit"], data["start_date"],
-                     data["last_date"], data["salary"], data["fee"], data["pdf_url"], data["apply_url"])
+                     data["last_date"], data["salary"], data["fee"], data["selection_process"],
+                     data["pdf_url"], data["apply_url"], sorted(sections.keys()))
 
     except Exception as e:
         logging.error(f"Scraping Error: {e}")
@@ -656,41 +1095,31 @@ Text:
         logging.info(f"AI ne ye missing fields bhare: {filled}")
 
 
-def sanitize_ai_html(body):
-    """AI ke HTML se code fences, source/social links, source site ke naam aur 'N/A' hatata hai."""
-    body = re.sub(r"^```(?:html)?\s*", "", body or "", flags=re.IGNORECASE | re.MULTILINE)
-    body = re.sub(r"```\s*$", "", body, flags=re.MULTILINE)
-    body = re.sub(r"<p>```.*?</p>", "", body, flags=re.DOTALL)
-    body = body.strip()
-    if not body:
+def ai_intro(job):
+    """Chhota Hinglish intro paragraph (sirf diye gaye facts se). Fail ho to khaali string."""
+    facts = {
+        "Title": job["title"], "Category": job["category"],
+        "Organisation": _cs(job["department"]), "Post": _cs(job["post_name"]),
+        "Total vacancies": _cs(job["total_vacancies"]), "Qualification": _cs(job["qualification"]),
+        "Start date": _cs(job["start_date"]), "Last date": _cs(job["last_date"]),
+        "Age limit": _cs(job["age_limit"]), "Fee": _cs(job["fee"]),
+        "Selection": _cs(job["selection_process"]),
+    }
+    facts_txt = "\n".join(f"{k}: {v}" for k, v in facts.items())
+    prompt = f"""Write ONE short paragraph (70-110 words) in simple Hinglish for an Indian government job website about this notification.
+Use ONLY the facts below. Do not invent anything. Do not mention any other website. No links, no HTML, no bullet points, no headings.
+If a fact says "{COMING_SOON}", you may say that the detail will be updated soon.
+
+{facts_txt}
+"""
+    txt = get_ai_response(prompt, rounds=2)
+    txt = re.sub(r"<[^>]+>", " ", txt or "")
+    txt = re.sub(r"[`*#]", "", txt)
+    txt = _strip_site_names(txt)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    if re.search(r"https?://|www\.", txt, re.IGNORECASE):
         return ""
-
-    soup = BeautifulSoup(body, "html.parser")
-
-    for a in soup.find_all("a"):
-        href = (a.get("href") or "").strip()
-        if not re.match(r"^https?://", href, re.IGNORECASE) or _is_blocked_url(href) or _is_shortener(href):
-            a.unwrap()
-
-    for node in list(soup.find_all(string=True)):
-        if isinstance(node, Comment):
-            continue
-        parent = node.parent.name if node.parent else ""
-        if parent in ("script", "style"):
-            continue
-        text = str(node)
-        new = text
-        if EMPTY_CELL_RE.match(text):
-            new = COMING_SOON
-        elif parent in ("td", "th") and re.fullmatch(r"\s*[-–—]+\s*", text):
-            new = COMING_SOON
-        else:
-            new = re.sub(r"(?i)not\s+mentioned(?:\s+in\s+(?:the\s+)?source)?", COMING_SOON, new)
-            new = _strip_site_names(new)
-        if new != text:
-            node.replace_with(new)
-
-    return str(soup).strip()
+    return txt if 80 <= len(txt) <= 1200 else ""
 
 
 def validate_job_data(job):
@@ -716,9 +1145,11 @@ def validate_job_data(job):
         if val and (_is_blocked_url(val) or _is_shortener(val)):
             logging.warning(f"{key} source/aggregator link tha, hata diya: {val}")
             job[key] = ""
+    job["extra_links"] = [(t, h) for t, h in job.get("extra_links", []) if not _is_blocked_url(h) and not _is_shortener(h)]
 
-    if job.get("category") == "Latest Jobs" and not any(
-        job.get(x) for x in ["total_vacancies", "qualification", "last_date", "age_limit", "salary", "start_date"]
+    if job.get("category") == "Latest Jobs" and not job.get("sections") and not any(
+        job.get(x) for x in ["total_vacancies", "qualification", "last_date", "age_limit", "salary",
+                             "start_date", "fee", "selection_process"]
     ):
         problems.append("no structured recruitment facts extracted")
 
@@ -726,67 +1157,235 @@ def validate_job_data(job):
         raise RuntimeError("Publish validation failed: " + "; ".join(problems))
 
 
-def _guess_official_site(title: str) -> str:
-    # Disabled: official domains must come from actual source links.
-    return ""
-
-
 # ================= PAGE BUILDING =================
 def _date_label(category):
-    if category == "Result":
+    if category in ("Result", "Answer Key"):
         return "Released"
     if category == "Admit Card":
         return "Available from"
-    if category == "Answer Key":
-        return "Released"
     return "Last Date"
+
+
+def _simple_table(rows, header=("Particulars", "Details")):
+    head = ""
+    if header:
+        head = (f'<tr style="background:#f1f5f9;"><th style="padding:10px;text-align:left;">{_esc(header[0])}</th>'
+                f'<th style="padding:10px;text-align:left;">{_esc(header[1])}</th></tr>')
+    body = "".join(
+        f'<tr><td style="padding:10px;"><b>{_esc(a)}</b></td><td style="padding:10px;">{_html_text(b)}</td></tr>'
+        for a, b in rows
+    )
+    return f"<table {TABLE_STYLE}>{head}{body}</table>"
+
+
+def _render_table(rows, cs=False):
+    clean = []
+    for r in rows:
+        if any(JUNK_LINE_RE.search(c["t"]) or any(_is_blocked_url(u) for u in _extract_explicit_urls(c["t"])) for c in r):
+            continue
+        clean.append([{"t": _strip_site_names(c["t"]), "b": c["b"]} for c in r])
+    if not clean:
+        return ""
+    ncols = max(len(r) for r in clean)
+    for r in clean:
+        while len(r) < ncols:
+            r.append({"t": "", "b": False})
+
+    has_header = len(clean) > 1 and ncols >= 2 and all(c["b"] for c in clean[0])
+    out = [f"<table {TABLE_STYLE}>"]
+    body_rows = clean
+    if has_header:
+        out.append('<tr style="background:#f1f5f9;">' +
+                   "".join(f'<th style="padding:10px;text-align:left;">{_html_text(c["t"])}</th>' for c in clean[0]) + "</tr>")
+        body_rows = clean[1:]
+    for r in body_rows:
+        cells = []
+        for i, c in enumerate(r):
+            txt = _html_text(_display_cell(c["t"], cs))
+            if i == 0 and ncols == 2 and not has_header:
+                txt = f"<b>{txt}</b>"
+            cells.append(f'<td style="padding:10px;vertical-align:top;">{txt}</td>')
+        out.append("<tr>" + "".join(cells) + "</tr>")
+    out.append("</table>")
+    return "".join(out)
+
+
+def _render_kv_list(items):
+    kv, others = [], []
+    for it in items:
+        pair = _split_kv(it)
+        (kv if pair else others).append(pair or it)
+    html_out = ""
+    if kv:
+        html_out += _simple_table([(a, _display_cell(b, True)) for a, b in kv], header=None)
+    if others:
+        html_out += "<ul>" + "".join(f"<li>{_html_text(o)}</li>" for o in others) + "</ul>"
+    return html_out
+
+
+def _render_blocks(blocks, kind):
+    kv_kinds = {"dates", "fee", "age", "pay"}
+    cs_kinds = {"dates", "overview", "fee", "age", "pay"}
+    out = []
+    for b in blocks:
+        if b[0] == "table":
+            out.append(_render_table(b[1], cs=kind in cs_kinds))
+        elif b[0] == "list":
+            items = [i for i in (_safe_text(x) for x in b[1]) if i]
+            if not items:
+                continue
+            if kind in kv_kinds:
+                out.append(_render_kv_list(items))
+            else:
+                tag = "ol" if kind == "selection" else "ul"
+                out.append(f"<{tag}>" + "".join(f"<li>{_html_text(i)}</li>" for i in items) + f"</{tag}>")
+        elif b[0] == "para":
+            t = _safe_text(b[1])
+            if not t:
+                continue
+            if kind == "vacancy" and re.fullmatch(r"[0-9][0-9,]*\s*(?:posts?|vacanc(?:y|ies))", t, re.IGNORECASE):
+                out.append(f"<p><b>Total Posts:</b> {_esc(t)}</p>")
+            elif len(t) <= (250 if kind == "other" else 400):
+                out.append(f"<p>{_html_text(t)}</p>")
+    return "".join(out)
+
+
+def _apply_steps(job):
+    cat = job["category"]
+    last = job["last_date"]
+    if cat == "Result":
+        title, steps = "How to Check Result", [
+            "Official result portal kholein (link neeche Important Links me diya gaya hai).",
+            "Result / Score Card wale link par click karein.",
+            "Roll number / Registration number aur zaroori details bharein.",
+            "Result dekhein aur PDF download ya print karke rakh lein.",
+        ]
+    elif cat == "Admit Card":
+        title, steps = "How to Download Admit Card", [
+            "Official website kholein (link neeche Important Links me diya gaya hai).",
+            "Admit Card / Hall Ticket wale link par click karein.",
+            "Registration number / Roll number aur password ya date of birth bharein.",
+            "Admit Card download karein aur exam ke din print copy saath le jayein.",
+        ]
+    elif cat == "Answer Key":
+        title, steps = "How to Check Answer Key", [
+            "Official website kholein (link neeche Important Links me diya gaya hai).",
+            "Answer Key / Response Sheet wale link par click karein.",
+            "Login details bharein aur answer key download karein.",
+            "Agar objection ka option ho to last date se pehle apna objection darj karein.",
+        ]
+    else:
+        title, steps = "How to Apply", [
+            "Official website kholein (link neeche Important Links me diya gaya hai).",
+            "Official notification dhyan se padhein aur eligibility check karein.",
+            "Registration / login karke online application form bharein.",
+            "Zaroori documents, photo aur signature upload karein.",
+            "Agar fee lagti hai to online fee jama karein (fee details upar di gayi hain).",
+            "Form submit karein aur print ya PDF copy save karke rakhein.",
+        ]
+    html_out = f"<h2>{_esc(title)}</h2><ol>" + "".join(f"<li>{_esc(s)}</li>" for s in steps) + "</ol>"
+    if last:
+        html_out += f"<p><b>{_esc(_date_label(cat))}:</b> {_esc(last)}</p>"
+    return html_out
+
+
+def build_faqs(job):
+    """Sirf maujood facts se FAQ (Coming Soon wali cheezein shaamil nahi)."""
+    name = _short_title(job["title"])
+    faqs = []
+
+    def add(q, a):
+        faqs.append((q, a))
+
+    cat = job["category"]
+    if job["last_date"]:
+        add(f"{name} ki last date kya hai?", f"{name} ke liye {_date_label(cat).lower()} {job['last_date']} hai.")
+    if job["start_date"]:
+        add(f"{name} ka form kab se bhara jayega?", f"Online application {job['start_date']} se shuru hogi.")
+    if job["total_vacancies"]:
+        add(f"{name} me kitni vacancy hain?", f"Is bharti me total {job['total_vacancies']} posts hain.")
+    if job["qualification"] and not _is_weak(job["qualification"]):
+        add(f"{name} ke liye qualification kya chahiye?", f"Qualification: {job['qualification']}.")
+    if job["age_limit"]:
+        add(f"{name} ki age limit kya hai?", f"Age limit: {job['age_limit']}.")
+    if job["fee"]:
+        add(f"{name} ki application fee kitni hai?", f"Application fee: {job['fee']}.")
+    if job["salary"]:
+        add(f"{name} me salary kitni milegi?", f"Salary / Pay: {job['salary']}.")
+    if job["selection_process"]:
+        add(f"{name} me selection kaise hoga?", f"Selection process: {job['selection_process']}.")
+    if cat == "Latest Jobs":
+        add(f"{name} ke liye apply kaise karein?",
+            "Official website par jaakar online form bharein. Official link is page ke Important Links table me diya gaya hai.")
+    return faqs[:10]
+
+
+def build_page_body(job, intro):
+    """Source ki jaankari se poora page body: intro, summary, sections, apply steps, FAQ."""
+    parts = []
+    parts.append(f"<p>{_esc(intro)}</p>")
+
+    summary_rows = [
+        ("Organisation", _cs(job["department"])),
+        ("Post Name", _cs(job["post_name"])),
+        ("Total Vacancies", _cs(job["total_vacancies"])),
+        ("Qualification", _cs(job["qualification"])),
+        ("Start Date", _cs(job["start_date"])),
+        (_date_label(job["category"]) if job["category"] != "Latest Jobs" else "Last Date", _cs(job["last_date"])),
+    ]
+    parts.append("<h2>Quick Summary</h2>" + _simple_table(summary_rows))
+
+    sections = job.get("sections", {})
+    rendered = 0
+    for kind, heading in SECTION_ORDER:
+        blocks_list = sections.get(kind, [])
+        if kind == "overview" and not blocks_list:
+            blocks_list = sections.get("keypoints", [])
+        body = "".join(_render_blocks(blocks, kind) for blocks in blocks_list)
+        if body.strip():
+            parts.append(f"<h2>{_esc(heading)}</h2>{body}")
+            rendered += 1
+
+    if rendered == 0:
+        lines = _summary_lines(job["raw_text"])
+        if lines:
+            parts.append("<h2>Important Highlights</h2><ul>" + "".join(f"<li>{_esc(l)}</li>" for l in lines) + "</ul>")
+
+    parts.append(_apply_steps(job))
+
+    faqs = build_faqs(job)
+    if faqs:
+        parts.append("<h2>Frequently Asked Questions</h2>" + "".join(
+            f"<h3>{_esc(q)}</h3><p>{_esc(a)}</p>" for q, a in faqs))
+    return "".join(parts), faqs
+
+
+def default_intro(job):
+    parts = [f"{job['title']} ki poori jaankari is page par di gayi hai."]
+    if job["department"]:
+        parts.append(f"Yeh notification {job['department']} ki taraf se hai.")
+    if job["total_vacancies"]:
+        parts.append(f"Total vacancy: {job['total_vacancies']}.")
+    if job["last_date"]:
+        parts.append(f"{_date_label(job['category'])}: {job['last_date']}.")
+    if job["qualification"] and not _is_weak(job["qualification"]):
+        parts.append(f"Qualification: {job['qualification']}.")
+    parts.append("Neeche important dates, eligibility, fee, selection process aur official links diye gaye hain. "
+                 f"Jis detail ki jaankari abhi uplabdh nahi hai, wahan '{COMING_SOON}' likha gaya hai.")
+    return " ".join(parts)
 
 
 def _summary_lines(raw_text, limit=8):
     keys = re.compile(r"(?i)(vacanc|qualification|eligib|age limit|last date|closing date|start date|selection|fee|salary|pay scale|exam date)")
     seen, out = set(), []
     for line in (raw_text or "").splitlines():
-        s = re.sub(r"\s+", " ", line).strip()
+        s = _safe_text(re.sub(r"\s+", " ", line))
         if 25 <= len(s) <= 220 and keys.search(s) and s.lower() not in seen:
             seen.add(s.lower())
             out.append(s)
         if len(out) >= limit:
             break
     return out
-
-
-def build_fallback_body(job):
-    """AI na chale to sirf source ke facts se page body; jo detail nahi mili wahan 'Coming Soon'."""
-    rows = [
-        ("Total Vacancies", job["total_vacancies"]),
-        ("Start Date", job["start_date"]),
-        ("Last Date", job["last_date"]),
-        ("Qualification", job["qualification"]),
-        ("Age Limit", job["age_limit"]),
-        ("Salary / Pay Scale", job["salary"]),
-        ("Application Fee", job["fee"]),
-        ("Selection Process", job["selection_process"]),
-        ("Department", job["department"]),
-        ("Post Name", job["post_name"]),
-    ]
-    table_rows = "".join(
-        f'<tr><td style="padding:10px;"><b>{_esc(label)}</b></td><td style="padding:10px;">{_esc(_cs(value))}</td></tr>'
-        for label, value in rows
-    )
-    highlights = _summary_lines(job["raw_text"])
-    highlights_html = ""
-    if highlights:
-        highlights_html = "<h2>Important Highlights</h2><ul>" + "".join(f"<li>{_esc(h)}</li>" for h in highlights) + "</ul>"
-
-    return (
-        f"<h2>Overview</h2><p>{_esc(job['title'])} ki jaankari neeche di gayi hai. "
-        f"Jis detail ki official jaankari abhi uplabdh nahi hai, wahan '{COMING_SOON}' likha gaya hai.</p>"
-        '<table border="1" style="width:100%; border-collapse:collapse; margin:20px 0; font-size:0.95rem;">'
-        '<tr style="background:#f1f5f9;"><th style="padding:10px;text-align:left;">Particulars</th>'
-        '<th style="padding:10px;text-align:left;">Details</th></tr>'
-        f"{table_rows}</table>"
-        f"{highlights_html}"
-    )
 
 
 def _build_links_table(job, link1_label, link2_label):
@@ -808,6 +1407,9 @@ def _build_links_table(job, link1_label, link2_label):
         row(link1_label, job.get("pdf_url", "")),
         row(link2_label, job.get("apply_url", "")),
     ]
+    for title, href in job.get("extra_links", []):
+        if href and not _is_blocked_url(href):
+            rows.append(row(title, href))
     return f"""
 <table border="1" style="width:100%; border-collapse:collapse; margin:28px 0; font-size:0.95rem;">
   <tr style="background:#f1f5f9;">
@@ -819,9 +1421,22 @@ def _build_links_table(job, link1_label, link2_label):
 """
 
 
-def generate_full_html_page(job, ai_content):
+def _meta_description(job):
+    bits = []
+    if job["last_date"]:
+        bits.append(f"{_date_label(job['category'])} {job['last_date']}")
+    if job["total_vacancies"]:
+        bits.append(f"{job['total_vacancies']} vacancies")
+    if job["qualification"] and not _is_weak(job["qualification"]):
+        bits.append(f"qualification {job['qualification']}")
+    facts = (" – " + ", ".join(bits) + ".") if bits else " –"
+    desc = f"{job['title']}{facts} Complete details, important dates, fee, selection process and official links. Updated {job['post_date']}."
+    return re.sub(r"\s+", " ", desc)[:300]
+
+
+def generate_full_html_page(job, ai_content, faqs=None):
     page_title = f"{job['title']} | Download Link & Details 2026 - BG Sarkari Result"
-    meta_desc = f"{job['title']} – complete details, important dates, how to check/download and official links. Updated {job['post_date']}."
+    meta_desc = _meta_description(job)
     canonical_url = f"{SITE_BASE_URL}/jobs/{job['slug']}.html"
 
     if job['category'] == 'Result':
@@ -860,6 +1475,20 @@ def generate_full_html_page(job, ai_content):
         + json.dumps(ld, ensure_ascii=False, indent=2).replace("</", "<\\/")
         + "\n</script>"
     )
+    if faqs:
+        faq_ld = {
+            "@context": "https://schema.org",
+            "@type": "FAQPage",
+            "mainEntity": [
+                {"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}}
+                for q, a in faqs
+            ],
+        }
+        json_ld += (
+            '\n<script type="application/ld+json">\n'
+            + json.dumps(faq_ld, ensure_ascii=False, indent=2).replace("</", "<\\/")
+            + "\n</script>"
+        )
 
     keywords = f"{job['title']}, {job['category']}, download, official, notification, BG Sarkari Result"
 
@@ -1146,80 +1775,19 @@ def update_sitemap(new_url):
 # ================= MAIN FLOW =================
 async def process_and_publish(job_source_url):
     job = scrape_job_details(job_source_url)
-    if job["title"].startswith("Latest Government Job Recruitment Notification"):
-        await _notify_telegram_plain(
-            "⚠️ Scraping thik se nahi hui (generic title use ho raha hai)."
-        )
 
-    # Regex se jo fields nahi mile, AI se (source text ke andar se) nikalwao
+    # Regex / sections se jo fields nahi mile, AI se (source text ke andar se) nikalwao
     ai_fill_missing_fields(job)
 
     # Galat / khaali data wale pages publish hone se pehle roko (aur source/aggregator links hatao)
     validate_job_data(job)
 
-    # ================= SEO-FRIENDLY AI PROMPT =================
-    blog_prompt = f"""
-You are an expert Indian Sarkari Job content writer and SEO specialist.
-Write a clean, professional, SEO-optimized HTML article body for this notification:
+    # Page body: source ke facts se sections (AI fail ho tab bhi page bhara hua banta hai).
+    # AI sirf ek chhota Hinglish intro likhta hai; fail ho to default intro lagta hai.
+    intro = ai_intro(job) or default_intro(job)
+    body_html, faqs = build_page_body(job, intro)
 
-Title: {job['title']}
-Category: {job['category']}
-Total Vacancies: {_cs(job['total_vacancies'])}
-Last Date / Available from: {_cs(job['last_date'])}
-Start Date: {_cs(job['start_date'])}
-Qualification: {_cs(job['qualification'])}
-Age Limit: {_cs(job['age_limit'])}
-Source Raw Text: {job['raw_text'][:12000]}
-Extracted Salary: {_cs(job['salary'])}
-Extracted Fee: {_cs(job['fee'])}
-Extracted Selection Process: {_cs(job['selection_process'])}
-Extracted Department: {_cs(job['department'])}
-Extracted Post Name: {_cs(job['post_name'])}
-Extracted Official Website: {_cs(job['official_site'])}
-Extracted Notification URL: {_cs(job['pdf_url'])}
-Extracted Apply URL: {_cs(job['apply_url'])}
-
-STRICT RULES (MUST FOLLOW):
-1. Return ONLY raw HTML. No markdown, no ```html, no code fences.
-2. Start directly with content. Do NOT repeat the full title in the first paragraph.
-3. Use proper semantic HTML:
-   - <h2> for main sections
-   - <h3> for sub-sections
-   - <p> for paragraphs
-   - <ul> / <ol> for lists
-   - Real HTML <table> (never markdown table)
-4. Table style (copy exactly):
-   <table border="1" style="width:100%; border-collapse:collapse; margin:20px 0; font-size:0.95rem;">
-     <tr style="background:#f1f5f9;"><th style="padding:10px; text-align:left;">Particulars</th><th style="padding:10px; text-align:left;">Details</th></tr>
-     ...
-   </table>
-5. Write in simple, natural Hinglish (easy for students).
-6. Include these sections in order (if relevant):
-   - Short Introduction (2-3 lines) – title ke related, koi galat exam name mat likho
-   - Important Overview Table (Exam Name, Category, Vacancies, Date, Qualification)
-   - Important Dates / Exam Schedule (agar raw text me mile)
-   - How to Check Result / Download Admit Card / Apply (step-by-step <ol>) – category ke hisaab se
-   - Required Documents (agar relevant)
-   - Important Instructions / Notes
-7. Naturally use keywords from the actual title: "{job['title']}", "download", "official", "{job['category']}".
-8. Keep total length 450-700 words. Mobile-friendly short paragraphs.
-9. NEVER invent RRB / Group D / CEN details unless the title itself contains them.
-10. Do NOT include any links table or "Important Links" section – that is added by the template.
-11. If any detail is missing or unknown (shown as "{COMING_SOON}" above), write exactly "{COMING_SOON}" for it.
-    NEVER write "Not mentioned", "N/A", "TBA" or guess a value.
-12. NEVER mention any other website or aggregator name (like FreeJobAlert or SarkariResult) and NEVER add any hyperlinks.
-"""
-
-    ai_raw = get_ai_response(blog_prompt, rounds=3)
-    ai_html_body = sanitize_ai_html(ai_raw) if ai_raw else ""
-
-    # AI unavailable ya bekaar output: sirf factual source-based summary (guess nahi), missing = Coming Soon
-    visible_len = len(BeautifulSoup(ai_html_body, "html.parser").get_text(strip=True)) if ai_html_body else 0
-    if visible_len < 150 or not any(t in ai_html_body.lower() for t in ("<h2", "<p", "<table")):
-        logging.warning("AI article usable nahi mila — fallback factual summary use ho rahi hai.")
-        ai_html_body = build_fallback_body(job)
-
-    full_html = generate_full_html_page(job, ai_html_body)
+    full_html = generate_full_html_page(job, body_html, faqs)
 
     html_repo_path = f"jobs/{job['slug']}.html"
     if not push_to_github(html_repo_path, full_html, f"Add/Update page: {job['slug']}"):
@@ -1252,13 +1820,16 @@ STRICT RULES (MUST FOLLOW):
     update_sitemap(page_url)
 
     # Telegram Notification
-    tg_caption = (
-        f"📢 <b>New Update ({_esc(job['category'], quote=False)}) 2026</b>\n\n"
-        f"🎯 <b>{_esc(job['title'], quote=False)}</b>\n\n"
-        f"📅 {_date_label(job['category'])}: {_esc(_cs(job['last_date']), quote=False)}\n"
-        f"👥 Vacancies: {_esc(_cs(job['total_vacancies']), quote=False)}\n\n"
-        f"📄 Complete Details & Links:\n{page_url}"
-    )
+    lines = [
+        f"📢 <b>New Update ({_esc(job['category'], quote=False)}) 2026</b>\n",
+        f"🎯 <b>{_esc(job['title'], quote=False)}</b>\n",
+        f"📅 {_date_label(job['category'])}: {_esc(_cs(job['last_date']), quote=False)}",
+        f"👥 Vacancies: {_esc(_cs(job['total_vacancies']), quote=False)}",
+    ]
+    if job["qualification"] and len(job["qualification"]) <= 80 and not _is_weak(job["qualification"]):
+        lines.append(f"🎓 Qualification: {_esc(job['qualification'], quote=False)}")
+    lines.append(f"\n📄 Complete Details & Links:\n{page_url}")
+    tg_caption = "\n".join(lines)
 
     try:
         tg_bot = Bot(token=TELEGRAM_BOT_TOKEN)
