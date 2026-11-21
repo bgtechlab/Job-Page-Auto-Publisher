@@ -1772,6 +1772,117 @@ def update_sitemap(new_url):
                 logging.error(f"Sitemap update permanently failed after {MAX_RETRIES} attempts.")
 
 
+
+# ================= BUFFER SOCIAL PUBLISHER (FACEBOOK + INSTAGRAM ONLY) =================
+BUFFER_ACCESS_TOKEN = os.getenv("BUFFER_ACCESS_TOKEN", "").strip()
+
+
+def get_buffer_social_channels():
+    """Buffer account se sirf Facebook aur Instagram channels leta hai; Pinterest jaanbujhkar exclude hai."""
+    if not BUFFER_ACCESS_TOKEN:
+        logging.warning("BUFFER_ACCESS_TOKEN missing — Buffer social posting skip.")
+        return []
+    api_url = "https://api.buffer.com"
+    headers = {"Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    try:
+        org_res = requests.post(api_url, json={"query": "query { account { organizations { id name } } }"}, headers=headers, timeout=20)
+        org_res.raise_for_status()
+        org_data = org_res.json()
+        if org_data.get("errors"):
+            raise RuntimeError(str(org_data["errors"])[:400])
+        orgs = org_data.get("data", {}).get("account", {}).get("organizations", [])
+        if not orgs:
+            logging.error("Buffer account mein organization nahi mili.")
+            return []
+        channel_query = """
+        query GetChannels($input: ChannelsInput!) {
+          channels(input: $input) { id service name }
+        }
+        """
+        channel_res = requests.post(api_url, json={"query": channel_query, "variables": {"input": {"organizationId": orgs[0]["id"]}}}, headers=headers, timeout=20)
+        channel_res.raise_for_status()
+        channel_data = channel_res.json()
+        if channel_data.get("errors"):
+            raise RuntimeError(str(channel_data["errors"])[:400])
+        channels = []
+        for channel in channel_data.get("data", {}).get("channels", []):
+            service = (channel.get("service") or "").lower()
+            if service in {"facebook", "instagram"}:
+                channels.append({"id": channel["id"], "service": service, "name": channel.get("name") or service})
+        for channel in channels:
+            logging.info("Buffer channel: %s (%s)", channel["name"], channel["service"])
+        if not channels:
+            logging.warning("Buffer par Facebook/Instagram channel nahi mila.")
+        return channels
+    except Exception as exc:
+        logging.error("Buffer channels fetch failed: %s", exc)
+        return []
+
+
+def send_job_post_to_buffer(job, page_url):
+    """Job ki image + details + Job Page link ko Facebook/Instagram Buffer queues mein bhejta hai."""
+    if not BUFFER_ACCESS_TOKEN:
+        logging.warning("BUFFER_ACCESS_TOKEN missing — social posting skip.")
+        return False
+    image_url = (job.get("image") or DEFAULT_FALLBACK_IMAGE).strip()
+    if not image_url.startswith(("https://", "http://")):
+        image_url = DEFAULT_FALLBACK_IMAGE
+    channels = get_buffer_social_channels()
+    if not channels:
+        return False
+    title = (job.get("title") or "Latest Job Update").strip()
+    category = (job.get("category") or "Latest Jobs").strip()
+    caption = "\n".join([
+        f"📢 {title}",
+        f"📌 Category: {category}",
+        f"👥 Vacancies: {_cs(job.get('total_vacancies'))}",
+        f"🎓 Qualification: {_cs(job.get('qualification'))}",
+        f"📅 Last Date: {_cs(job.get('last_date'))}",
+        "",
+        "Read complete details, eligibility and official application links:",
+        page_url,
+        "",
+        "#GovernmentJobs #SarkariResult #LatestJobs #JobAlert",
+    ])
+    if len(caption) > 2000:
+        caption = caption[:1990].rsplit(" ", 1)[0] + "…"
+    api_url = "https://api.buffer.com"
+    headers = {"Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    mutation = """
+    mutation CreatePost($input: CreatePostInput!) {
+      createPost(input: $input) {
+        ... on PostActionSuccess { post { id } }
+        ... on MutationError { message }
+      }
+    }
+    """
+    all_ok = True
+    for channel in channels:
+        metadata = {"facebook": {"type": "post"}} if channel["service"] == "facebook" else {"instagram": {"type": "post", "shouldShareToFeed": True}}
+        variables = {"input": {
+            "channelId": channel["id"], "text": caption, "mode": "addToQueue",
+            "schedulingType": "automatic", "assets": [{"image": {"url": image_url}}],
+            "metadata": metadata,
+        }}
+        try:
+            response = requests.post(api_url, json={"query": mutation, "variables": variables}, headers=headers, timeout=30)
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("errors"):
+                raise RuntimeError(str(payload["errors"])[:500])
+            result = payload.get("data", {}).get("createPost", {})
+            post_id = result.get("post", {}).get("id")
+            if post_id:
+                logging.info("Job post Buffer queue mein add: %s (%s), post ID=%s", channel["name"], channel["service"], post_id)
+            else:
+                all_ok = False
+                logging.error("Buffer %s (%s): %s", channel["name"], channel["service"], result.get("message") or payload)
+        except Exception as exc:
+            all_ok = False
+            logging.error("Buffer post failed for %s (%s): %s", channel["name"], channel["service"], exc)
+    return all_ok
+
+
 # ================= MAIN FLOW =================
 async def process_and_publish(job_source_url):
     job = scrape_job_details(job_source_url)
