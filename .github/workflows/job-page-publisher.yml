@@ -29,4 +29,5 @@ jobs:
           SITE_BASE_URL: "https://bgsarkariresult.github.io/bgsarkariresult"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BUFFER_ACCESS_TOKEN: ${{ secrets.BUFFER_ACCESS_TOKEN }}
         run: python full_automation_bot.py
