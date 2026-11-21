@@ -1930,6 +1930,16 @@ async def process_and_publish(job_source_url):
     update_jobs_json(json_entry)
     update_sitemap(page_url)
 
+    # Buffer: page live hone ke baad Facebook + Instagram queue.
+    # Social failure se website publishing fail nahi hogi.
+    try:
+        if send_job_post_to_buffer(job, page_url):
+            logging.info("Facebook/Instagram posts Buffer queue mein add ho gayi.")
+        elif BUFFER_ACCESS_TOKEN:
+            logging.warning("Buffer par ek ya zyada social posts add nahi ho payi.")
+    except Exception as exc:
+        logging.error("Buffer social publishing error (website page safe): %s", exc)
+
     # Telegram Notification
     lines = [
         f"📢 <b>New Update ({_esc(job['category'], quote=False)}) 2026</b>\n",
