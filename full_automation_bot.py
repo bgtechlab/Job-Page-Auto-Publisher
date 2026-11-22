@@ -1824,7 +1824,7 @@ def send_job_post_to_buffer(job, page_url):
     if not BUFFER_ACCESS_TOKEN:
         logging.warning("BUFFER_ACCESS_TOKEN missing — social posting skip.")
         return False
-    image_url = (job.get("image") or DEFAULT_FALLBACK_IMAGE).strip()
+    image_url = "https://raw.githubusercontent.com/bgtechlab/Job-Page-Auto-Publisher/main/assets/exam-updates-alerts.jpg"
     if not image_url.startswith(("https://", "http://")):
         image_url = DEFAULT_FALLBACK_IMAGE
     channels = get_buffer_social_channels()
